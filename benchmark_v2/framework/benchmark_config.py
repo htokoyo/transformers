@@ -70,7 +70,6 @@ class BenchmarkConfig:
         self.check_validity(skip_validity_check)
         self.name = name if name is not None else self.infer_name()
 
-    # TODO: add validity checks for continuous batching
     def check_validity(self, skip_validity_check: bool = False) -> None:
         if skip_validity_check:
             return
@@ -87,6 +86,11 @@ class BenchmarkConfig:
         if is_fa:
             logger.warning("Flash attention does not support compile mode. Turning off compile mode.")
             self.compile_mode = None
+        if self.continuous_batching and self.attn_implementation == "flex_attention":
+            logger.error(
+                "disabling continuous batching because of invalid configuration: flex attention is not supported"
+            )
+            self.continuous_batching = False
 
     @property
     def hash(self) -> str:
@@ -191,6 +195,7 @@ def cross_generate_configs(
     return configs
 
 
+# TODO: add support for flex attention in CB
 def generate_main_configs(
     warmup_iterations: int = 5,
     measurement_iterations: int = 20,
