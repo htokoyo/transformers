@@ -43,7 +43,7 @@ RUN python3 -m pip uninstall -y deepspeed
 # This has to be run (again) inside the GPU VMs running the tests.
 # The installation works here, but some tests fail, if we don't pre-build deepspeed again in the VMs running the tests.
 # TODO: Find out why test fail.
-RUN DS_BUILD_CPU_ADAM=1 DS_BUILD_FUSED_ADAM=1 python3 -m pip install deepspeed --global-option="build_ext" --global-option="-j8" --no-cache -v --disable-pip-version-check 2>&1
+RUN DS_BUILD_CPU_ADAM=1 DS_BUILD_FUSED_ADAM=1 python3 -m pip install deepspeed --no-build-isolation --config-settings="--build-option=build_ext" --config-settings="--build-option=-j8" --no-cache -v --disable-pip-version-check 2>&1
 
 # `kernels` may give different outputs (within 1e-5 range) even with the same model (weights) and the same inputs
 RUN python3 -m pip uninstall -y kernels
