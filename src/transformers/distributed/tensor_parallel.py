@@ -120,6 +120,37 @@ def _use_local_dtensor_params(module):
                 )
 
 
+@contextlib.contextmanager
+def _reduce_param_grads_over_mesh(module, group):
+    """Route this module's parameters through `_AllReduceBackward`, so their gradient is summed over the mesh.
+
+    A backward hook cannot do this. `register_full_backward_hook` fires when the module's *input* gradients are
+    ready, which is before `AccumulateGrad` has written `param.grad`: on the first backward there is nothing to
+    reduce, and on every later one the value already reduced gets reduced again. Putting the reduction on the path
+    from the parameter into the forward puts it where the gradient is, exactly once per forward, so gradient
+    accumulation and DTensor parameters both work.
+    """
+    originals = {name: p for name, p in module._parameters.items() if p is not None and p.requires_grad}
+    reduced = {}
+    for name, param in originals.items():
+        if isinstance(param, DTensor):
+            # DTensor has no sharding strategy for `c10d.allreduce_`, so the collective runs on the local shard.
+            # The parameter is replicated over this mesh, and any other mesh dimension shards it identically on
+            # every rank of this group, so the local shards line up.
+            local = _AllReduceBackward.apply(param.to_local(), group)
+            reduced[name] = DTensor.from_local(local, param.device_mesh, param.placements, run_check=False)
+        else:
+            reduced[name] = _AllReduceBackward.apply(param, group)
+    module._parameters.update(reduced)
+    try:
+        yield
+    finally:
+        for name, original in originals.items():
+            # Leave alone anything the forward replaced, as `_use_local_dtensor_params` does.
+            if module._parameters[name] is reduced[name]:
+                module._parameters[name] = original
+
+
 class TensorParallelLayer:
     def should_use_local_tensors(self, module):
         """Whether this module's forward requires local inputs and parameters."""
@@ -344,16 +375,10 @@ class ReplicatedWithGradAllReduce(TensorParallelLayer):
     summed across the mesh.
     """
 
-    def install_forward(self, module, mesh):
-        # A module hook rather than `param.register_hook`: params are replaced during weight
-        # loading, which happens after TP is applied, and would drop a param-level hook.
-        def _all_reduce_grads(mod, grad_input, grad_output):
-            for param in mod.parameters(recurse=False):
-                if param.grad is not None:
-                    dist.all_reduce(param.grad, group=mesh.get_group())
-
-        module.register_full_backward_hook(_all_reduce_grads)
-        return module
+    def context_around_forward(self, module, mesh):
+        # The parameters are read on each forward rather than bound once: they are replaced after TP is applied,
+        # by weight loading and again by FSDP, so anything captured here would be dropped.
+        return _reduce_param_grads_over_mesh(module, mesh.get_group())
 
 
 class AllReduceParallel(TensorParallelLayer):

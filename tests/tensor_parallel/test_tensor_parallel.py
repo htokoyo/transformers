@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
+import tempfile
 import warnings
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -365,3 +367,91 @@ class TestTensorParallelLayer(TestCasePlus):
 
                 self.assertEqual(module.random_attr, 123)
                 self.assertFalse(hasattr(module, "num_experts"))
+
+
+@is_tensor_parallel_test
+class TestReplicatedWithGradAllReduce(TestCasePlus):
+    """`replicated_with_grad_allreduce` holds a replicated parameter whose gradient is partial.
+
+    The parameter is the same on every rank, but each rank's forward only sees its own shard of the normalized axis,
+    so each rank's gradient covers only part of it and the gradients have to be summed over the mesh.
+    """
+
+    class ScaleModule(torch.nn.Module):
+        """Stands in for a norm: a replicated parameter applied to this rank's own activations."""
+
+        def __init__(self, size):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(size))
+
+        def forward(self, x):
+            return x * self.weight
+
+    def _install(self, module, group="process_group"):
+        mesh = MagicMock()
+        mesh.get_group.return_value = group
+        ALL_PARALLEL_STYLES["replicated_with_grad_allreduce"].install_forward(module, mesh)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _doubling_all_reduce():
+        """Stands in for a two-rank sum of identical contributions, so the reduction is visible in the gradient."""
+        with patch.object(
+            tensor_parallel.dist, "all_reduce", side_effect=lambda tensor, group=None: tensor.mul_(2)
+        ) as all_reduce:
+            yield all_reduce
+
+    def test_parameter_gradient_is_summed_over_the_mesh(self):
+        module = self.ScaleModule(3)
+        self._install(module)
+        x = torch.tensor([1.0, 2.0, 3.0])
+
+        with self._doubling_all_reduce() as all_reduce:
+            module(x).sum().backward()
+
+        # The reduction runs once, on this rank's own contribution, and what lands in `param.grad` is the sum.
+        self.assertEqual(all_reduce.call_count, 1)
+        torch.testing.assert_close(module.weight.grad, 2 * x)
+
+    def test_each_backward_is_reduced_exactly_once(self):
+        module = self.ScaleModule(3)
+        self._install(module)
+
+        with self._doubling_all_reduce() as all_reduce:
+            module(torch.ones(3)).sum().backward()
+            module(torch.full((3,), 2.0)).sum().backward()
+
+        # Under gradient accumulation each contribution has to be reduced once, so the accumulated gradient is the
+        # reduction of the sum: 2 * (1 + 2). A `register_full_backward_hook` reducing `param.grad` cannot do this, as
+        # it fires before `AccumulateGrad`: it would reduce nothing on the first backward and then reduce the value
+        # already accumulated on the second, giving 2 * 1 + 2.
+        self.assertEqual(all_reduce.call_count, 2)
+        torch.testing.assert_close(module.weight.grad, torch.full((3,), 6.0))
+
+    def test_dtensor_parameter_is_reduced_without_a_sharding_strategy(self):
+        # `dist.all_reduce` on a DTensor raises `NotImplementedError: Operator c10d.allreduce_.default does not have
+        # a sharding strategy registered`, so the collective has to run on the local shard. The parameters are
+        # DTensors whenever the model is also wrapped by FSDP.
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import Replicate, distribute_tensor
+
+        store = torch.distributed.FileStore(tempfile.mktemp(), 1)
+        torch.distributed.init_process_group("gloo", store=store, rank=0, world_size=1)
+        try:
+            mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+            module = self.ScaleModule(3)
+            module.register_parameter(
+                "weight", torch.nn.Parameter(distribute_tensor(module.weight.detach(), mesh, [Replicate()]))
+            )
+            self._install(module, group=mesh.get_group())
+
+            x = distribute_tensor(torch.tensor([1.0, 2.0, 3.0]), mesh, [Replicate()])
+            # Twice, because reducing `param.grad` only reaches a DTensor from the second backward on: on the first
+            # there is no gradient to reduce yet.
+            module(x).sum().backward()
+            module(x).sum().backward()
+
+            self.assertIsNotNone(module.weight.grad)
+            torch.testing.assert_close(module.weight.grad.full_tensor(), torch.tensor([2.0, 4.0, 6.0]))
+        finally:
+            torch.distributed.destroy_process_group()
